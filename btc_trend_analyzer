@@ -1,0 +1,14 @@
+# 基本分析
+python btc_trend_analyzer.py
+
+# 强制刷新数据
+python btc_trend_analyzer.py --refresh
+
+# 保存报告和图表
+python btc_trend_analyzer.py --report btc_report.txt --chart btc_chart.png
+
+# 指定交易所和交易对
+python btc_trend_analyzer.py --exchange binance --symbol "BTC/USDT"
+
+# 仅分析特定时间周期
+python btc_trend_analyzer.py --timeframes 1h,1d
