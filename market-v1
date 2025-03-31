@@ -1,0 +1,1106 @@
+import os
+import pandas as pd
+import numpy as np
+import requests
+import json
+import time
+import datetime
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import argparse
+from typing import Dict, List, Tuple, Any, Optional, Union
+import warnings
+warnings.filterwarnings("ignore")
+
+# 设置matplotlib中文字体支持
+plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial Unicode MS']
+plt.rcParams['axes.unicode_minus'] = False
+
+
+class FundInvestment:
+    """基金定投收益分析工具"""
+
+    def __init__(self, fund_id: str, investment_amount: float = 200, profit_threshold: float = 0.1):
+        """
+        初始化基金定投分析工具
+        
+        参数:
+            fund_id: 基金代码
+            investment_amount: 每次定投金额(元)
+            profit_threshold: 收益率阈值，达到该阈值时卖出(小数形式，如0.1表示10%)
+        """
+        self.fund_id = fund_id
+        self.investment_amount = investment_amount
+        self.profit_threshold = profit_threshold
+        self.data_dir = "fund_data"
+        self.results_dir = "investment_results"
+        self.ensure_dirs()
+        
+        # 初始化投资状态
+        self.reset_investment_status()
+        
+        # 初始化数据
+        self.fund_data = None
+        self.fund_info = None
+        
+        # 缓存
+        self._fund_data_cache = {}
+        
+    def ensure_dirs(self):
+        """确保数据和结果目录存在"""
+        for directory in [self.data_dir, self.results_dir]:
+            if not os.path.exists(directory):
+                os.makedirs(directory)
+    
+    def get_data_file_path(self):
+        """获取基金数据文件路径"""
+        return os.path.join(self.data_dir, f"fund_{self.fund_id}.csv")
+    
+    def get_fund_info_path(self):
+        """获取基金信息文件路径"""
+        return os.path.join(self.data_dir, f"fund_{self.fund_id}_info.json")
+    
+    def get_results_file_path(self, extension: str = "txt", threshold: Optional[float] = None):
+        """
+        获取结果文件路径
+        
+        参数:
+            extension: 文件扩展名
+            threshold: 收益阈值，如果提供则使用特定阈值的文件名
+        """
+        if threshold is not None:
+            return os.path.join(self.results_dir, f"fund_{self.fund_id}_threshold_{int(threshold*100)}pct.{extension}")
+        return os.path.join(self.results_dir, f"fund_{self.fund_id}_results.{extension}")
+    
+    def reset_investment_status(self):
+        """重置投资状态"""
+        self.total_investment = 0  # 总投资金额
+        self.current_value = 0     # 当前价值
+        self.units_held = 0        # 持有份额
+        self.investment_dates = [] # 投资日期
+        self.reset_logs = []       # 重置记录
+        
+    def fetch_fund_data(self):
+        """从网络获取基金数据"""
+        print(f"正在获取基金 {self.fund_id} 的历史数据...")
+        
+        try:
+            # 获取基金信息
+            info_url = f"http://fund.eastmoney.com/pingzhongdata/{self.fund_id}.js"
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                'Referer': 'http://fund.eastmoney.com/'
+            }
+            
+            response = requests.get(info_url, headers=headers, timeout=10)
+            response.raise_for_status()  # 检查HTTP错误
+            
+            # 提取数据部分
+            content = response.text
+            
+            # 提取基金名称
+            fund_name_match = content.find('fS_name = "') + 11
+            fund_name_end = content.find('";', fund_name_match)
+            fund_name = content[fund_name_match:fund_name_end]
+            
+            # 提取成立日期
+            establish_date_match = content.find('ESTABDATE = "') + 12
+            establish_date_end = content.find('";', establish_date_match)
+            establish_date = content[establish_date_match:establish_date_end]
+            
+            # 提取历史净值数据
+            data_match = content.find('Data_netWorthTrend = ') + 21
+            data_end = content.find(';', data_match)
+            data_json = content[data_match:data_end]
+            
+            # 解析JSON数据
+            historical_data = json.loads(data_json)
+            
+            # 保存基金基本信息
+            fund_info = {
+                "fund_id": self.fund_id,
+                "fund_name": fund_name,
+                "establish_date": establish_date
+            }
+            
+            with open(self.get_fund_info_path(), 'w', encoding='utf-8') as f:
+                json.dump(fund_info, f, ensure_ascii=False, indent=4)
+            
+            # 转换为DataFrame格式
+            dates = []
+            values = []
+            
+            for item in historical_data:
+                # 时间戳转换为日期
+                date = pd.to_datetime(item['x'], unit='ms')
+                value = item['y']  # 净值
+                
+                dates.append(date)
+                values.append(value)
+            
+            # 创建并保存DataFrame
+            df = pd.DataFrame({
+                'date': dates,
+                'value': values
+            })
+            
+            df.sort_values('date', inplace=True)
+            df.to_csv(self.get_data_file_path(), index=False)
+            
+            print(f"成功获取 {fund_name} ({self.fund_id}) 的历史数据，从 {df['date'].min().date()} 到 {df['date'].max().date()}")
+            print(f"数据已保存至 {self.get_data_file_path()}")
+            
+            self.fund_info = fund_info
+            return df
+        
+        except Exception as e:
+            print(f"获取基金数据时出错: {e}")
+            
+            # 创建示例数据
+            print("使用模拟数据代替...")
+            return self.create_mock_data()
+    
+    def create_mock_data(self):
+        """创建模拟基金数据"""
+        print("创建模拟基金数据...")
+        
+        # 设置时间范围 (3年)
+        end_date = datetime.datetime.now()
+        start_date = end_date - datetime.timedelta(days=3*365)
+        
+        # 创建交易日
+        dates = pd.date_range(start=start_date, end=end_date, freq='B')
+        
+        # 初始价格
+        price = 1.0
+        prices = []
+        
+        # 生成模拟净值
+        np.random.seed(42)  # 确保结果可复现
+        for i in range(len(dates)):
+            # 随机每日回报率
+            daily_return = np.random.normal(0.0005, 0.01)  # 均值约12%年化，波动约16%年化
+            
+            # 添加波动特征
+            if i > 30:
+                # 添加周期性波动
+                cycle = 0.005 * np.sin(i / 20)
+                cycle += 0.01 * np.sin(i / 60)  # 添加更长周期的波动
+                daily_return += cycle
+            
+            # 更新价格
+            price *= (1 + daily_return)
+            prices.append(price)
+        
+        # 创建DataFrame
+        df = pd.DataFrame({
+            'date': dates,
+            'value': prices
+        })
+        
+        # 保存到文件
+        df.to_csv(self.get_data_file_path(), index=False)
+        
+        # 保存模拟基金信息
+        fund_info = {
+            "fund_id": self.fund_id,
+            "fund_name": f"模拟基金{self.fund_id}",
+            "establish_date": start_date.strftime('%Y-%m-%d')
+        }
+        
+        with open(self.get_fund_info_path(), 'w', encoding='utf-8') as f:
+            json.dump(fund_info, f, ensure_ascii=False, indent=4)
+        
+        self.fund_info = fund_info
+        print(f"已创建模拟数据，时间范围: {dates[0].date()} 到 {dates[-1].date()}")
+        
+        return df
+    
+    def load_fund_data(self, refresh: bool = False):
+        """
+        加载基金数据，如果本地没有或需要刷新则从网络获取
+        
+        参数:
+            refresh: 是否强制刷新数据
+            
+        返回:
+            DataFrame: 基金历史净值数据
+        """
+        data_file = self.get_data_file_path()
+        info_file = self.get_fund_info_path()
+        
+        # 强制刷新或本地文件不存在
+        if refresh or not (os.path.exists(data_file) and os.path.exists(info_file)):
+            return self.fetch_fund_data()
+        
+        # 检查数据和信息文件是否都存在
+        try:
+            # 加载数据
+            df = pd.read_csv(data_file)
+            df['date'] = pd.to_datetime(df['date'])
+            
+            # 加载基金信息
+            with open(info_file, 'r', encoding='utf-8') as f:
+                self.fund_info = json.load(f)
+            
+            print(f"从本地加载基金数据成功: {self.fund_info['fund_name']} ({self.fund_id})")
+            print(f"数据时间范围: {df['date'].min().date()} 到 {df['date'].max().date()}")
+            
+            return df
+        
+        except Exception as e:
+            print(f"读取本地数据出错: {e}")
+            print("将尝试重新获取数据...")
+            return self.fetch_fund_data()
+    
+    def run_investment_strategy(self, verbose: bool = True, save_results: bool = True) -> dict:
+        """
+        运行投资策略:
+        1. 每个交易日定投固定金额
+        2. 收益率达到阈值时全部卖出
+        3. 卖出后继续定投
+        
+        参数:
+            verbose: 是否打印详细信息
+            save_results: 是否保存结果
+        
+        返回:
+            dict: 包含投资结果的详细数据
+        """
+        if self.fund_data is None or len(self._fund_data_cache) == 0:
+            self.fund_data = self.load_fund_data()
+            # 将数据放入缓存，以便重复使用
+            self._fund_data_cache[self.fund_id] = self.fund_data
+        else:
+            # 使用缓存数据
+            self.fund_data = self._fund_data_cache[self.fund_id]
+        
+        if self.fund_data.empty:
+            print("基金数据为空，无法执行投资策略")
+            return {"total_profit": 0, "overall_return": 0}
+        
+        if verbose:
+            print(f"\n===== 开始执行投资策略 =====")
+            print(f"基金: {self.fund_info['fund_name']} ({self.fund_id})")
+            print(f"每日定投金额: {self.investment_amount} 元")
+            print(f"收益率阈值: {self.profit_threshold*100}%")
+            print(f"投资时间范围: {self.fund_data['date'].min().date()} 到 {self.fund_data['date'].max().date()}")
+        
+        # 重置投资状态
+        self.reset_investment_status()
+        
+        # 按日期排序
+        self.fund_data.sort_values('date', inplace=True)
+        
+        # 添加买入日判断
+        buy_dates = self.fund_data['date'].tolist()
+        
+        # 初始化投资开始日期
+        current_investment_start_date = buy_dates[0]
+        
+        # 使用进度条
+        if verbose:
+            iterator = tqdm(buy_dates, desc=f"执行 {self.profit_threshold*100}% 阈值策略", ncols=100)
+        else:
+            iterator = buy_dates
+        
+        for current_date in iterator:
+            # 获取当日净值
+            current_value_per_unit = float(self.fund_data[self.fund_data['date'] == current_date]['value'].values[0])
+            
+            # 进行定投
+            new_units = self.investment_amount / current_value_per_unit
+            self.total_investment += self.investment_amount
+            self.units_held += new_units
+            self.current_value = self.units_held * current_value_per_unit
+            
+            # 记录投资日期
+            self.investment_dates.append(current_date)
+            
+            # 检查是否达到收益阈值
+            if self.total_investment > 0:
+                profit_percentage = (self.current_value - self.total_investment) / self.total_investment
+                
+                if profit_percentage >= self.profit_threshold:
+                    # 记录本次收益情况
+                    profit = self.current_value - self.total_investment
+                    
+                    reset_info = {
+                        'start_date': current_investment_start_date,
+                        'end_date': current_date,
+                        'duration_days': (current_date - current_investment_start_date).days,
+                        'total_investment': self.total_investment,
+                        'final_value': self.current_value,
+                        'profit': profit,
+                        'profit_percentage': profit_percentage * 100,
+                        'annualized_return': self.calculate_annualized_return(
+                            current_investment_start_date, 
+                            current_date, 
+                            self.total_investment, 
+                            self.current_value
+                        )
+                    }
+                    
+                    self.reset_logs.append(reset_info)
+                    
+                    # 输出详情
+                    if verbose and len(self.reset_logs) <= 5:  # 只打印前5次，避免输出过多
+                        days_passed = (current_date - current_investment_start_date).days
+                        print(f"\n⭐ 触发卖出! {current_date.date()} - 收益率: {profit_percentage*100:.2f}%")
+                        print(f"- 投资期间: {current_investment_start_date.date()} 到 {current_date.date()} ({days_passed}天)")
+                        print(f"- 投资金额: {self.total_investment:.2f}元")
+                        print(f"- 最终价值: {self.current_value:.2f}元")
+                        print(f"- 净收益: {profit:.2f}元")
+                        print(f"- 年化收益率: {reset_info['annualized_return']:.2f}%")
+                    
+                    # 重置投资状态
+                    self.total_investment = 0
+                    self.current_value = 0
+                    self.units_held = 0
+                    current_investment_start_date = current_date
+        
+        # 计算最终持仓收益情况
+        final_profit = 0
+        final_profit_percentage = 0
+        annualized_return = 0
+        
+        if self.total_investment > 0:
+            final_date = self.fund_data['date'].max()
+            final_value_per_unit = float(self.fund_data[self.fund_data['date'] == final_date]['value'].values[0])
+            self.current_value = self.units_held * final_value_per_unit
+            
+            final_profit = self.current_value - self.total_investment
+            final_profit_percentage = (final_profit / self.total_investment) * 100
+            
+            days_passed = (final_date - current_investment_start_date).days
+            annualized_return = self.calculate_annualized_return(
+                current_investment_start_date, 
+                final_date, 
+                self.total_investment, 
+                self.current_value
+            )
+            
+            # 最后一次持仓信息
+            final_holding = {
+                'start_date': current_investment_start_date,
+                'end_date': final_date,
+                'duration_days': days_passed,
+                'total_investment': self.total_investment,
+                'final_value': self.current_value,
+                'profit': final_profit,
+                'profit_percentage': final_profit_percentage,
+                'annualized_return': annualized_return,
+                'is_current': True
+            }
+            
+            if verbose:
+                print("\n📊 当前持仓状况:")
+                print(f"- 投资期间: {current_investment_start_date.date()} 到 {final_date.date()} ({days_passed}天)")
+                print(f"- 投资金额: {self.total_investment:.2f}元")
+                print(f"- 当前价值: {self.current_value:.2f}元")
+                print(f"- 持有份额: {self.units_held:.2f}份")
+                print(f"- 当前收益: {final_profit:.2f}元 ({final_profit_percentage:.2f}%)")
+                print(f"- 年化收益率: {annualized_return:.2f}%")
+        
+        # 生成汇总报告
+        summary_data = self.generate_summary_report(verbose=verbose, save=save_results)
+        
+        # 如果需要保存结果，生成图表
+        if save_results:
+            self.plot_investment_results(threshold=self.profit_threshold)
+        
+        # 返回投资结果数据
+        return {
+            "total_profit": summary_data["total_profit"],
+            "overall_return": summary_data["overall_return"],
+            "num_resets": summary_data["num_resets"],
+            "avg_hold_days": summary_data["avg_hold_days"],
+            "annualized_return": annualized_return,
+            "final_profit": final_profit,
+            "final_profit_percentage": final_profit_percentage,
+            "threshold": self.profit_threshold
+        }
+    
+    def calculate_annualized_return(self, start_date, end_date, investment, final_value):
+        """
+        计算年化收益率
+        
+        参数:
+            start_date: 投资开始日期
+            end_date: 投资结束日期
+            investment: 投资金额
+            final_value: 最终价值
+            
+        返回:
+            float: 年化收益率(百分比)
+        """
+        years = (end_date - start_date).days / 365
+        if years <= 0 or investment <= 0:
+            return 0
+            
+        # 计算年化收益率
+        return ((final_value / investment) ** (1 / years) - 1) * 100
+    
+    def generate_summary_report(self, verbose: bool = True, save: bool = True) -> Dict[str, Any]:
+        """
+        生成投资汇总报告
+        
+        参数:
+            verbose: 是否打印详细信息
+            save: 是否保存结果到文件
+            
+        返回:
+            dict: 包含汇总数据的字典
+        """
+        if not self.reset_logs and self.total_investment <= 0:
+            if verbose:
+                print("\n没有投资记录，无法生成报告")
+            return {"total_profit": 0, "overall_return": 0, "num_resets": 0, "avg_hold_days": 0}
+        
+        # 计算总统计数据
+        total_profit = 0
+        total_days = 0
+        total_investments = 0
+        num_resets = len(self.reset_logs)
+        
+        # 计算已实现收益
+        for reset in self.reset_logs:
+            total_profit += reset['profit']
+            total_days += reset['duration_days']
+            total_investments += reset['total_investment']
+        
+        # 加上当前持仓
+        current_profit = 0
+        if self.total_investment > 0:
+            current_profit = self.current_value - self.total_investment
+            total_profit += current_profit
+            
+            # 获取最后一次投资日期
+            if self.investment_dates:
+                last_start_date = max([r['start_date'] for r in self.reset_logs]) if self.reset_logs else self.investment_dates[0]
+                total_days += (self.investment_dates[-1] - last_start_date).days
+            
+            total_investments += self.total_investment
+        
+        # 计算总收益率
+        overall_return = (total_profit / total_investments) * 100 if total_investments > 0 else 0
+        
+        # 计算平均持有天数
+        avg_hold_days = total_days / (num_resets + 1) if (num_resets > 0 or self.total_investment > 0) else 0
+        
+        # 生成报告
+        report = []
+        report.append(f"====== 投资策略汇总报告 ({self.profit_threshold*100}% 阈值) ======")
+        report.append(f"基金名称: {self.fund_info['fund_name']} ({self.fund_id})")
+        report.append(f"投资策略: 每日定投 {self.investment_amount}元，收益达到 {self.profit_threshold*100}% 卖出")
+        report.append(f"投资期间: {self.fund_data['date'].min().date()} 到 {self.fund_data['date'].max().date()}")
+        report.append(f"卖出次数: {num_resets} 次")
+        report.append(f"总投资金额: {total_investments:.2f} 元")
+        report.append(f"总收益: {total_profit:.2f} 元 ({overall_return:.2f}%)")
+        report.append(f"平均持有天数: {avg_hold_days:.1f} 天")
+        
+        # 添加每次卖出的详细信息
+        if self.reset_logs:
+            report.append("\n==== 历史卖出记录 ====")
+            for i, reset in enumerate(self.reset_logs, 1):
+                if i <= 10 or i > len(self.reset_logs) - 3:  # 只显示前10次和最后3次
+                    report.append(f"\n卖出 #{i} ({reset['end_date'].date()}):")
+                    report.append(f"- 投资期间: {reset['start_date'].date()} 到 {reset['end_date'].date()} ({reset['duration_days']}天)")
+                    report.append(f"- 投资金额: {reset['total_investment']:.2f}元")
+                    report.append(f"- 卖出价值: {reset['final_value']:.2f}元")
+                    report.append(f"- 净收益: {reset['profit']:.2f}元 ({reset['profit_percentage']:.2f}%)")
+                    report.append(f"- 年化收益率: {reset['annualized_return']:.2f}%")
+                elif i == 11 and len(self.reset_logs) > 13:
+                    report.append(f"\n... 省略 {len(self.reset_logs) - 13} 次卖出记录 ...")
+        
+        # 添加当前持仓信息
+        if self.total_investment > 0:
+            final_date = self.fund_data['date'].max()
+            final_profit = self.current_value - self.total_investment
+            final_profit_percentage = (final_profit / self.total_investment) * 100
+            
+            # 找出最后一次开始投资的日期
+            last_start_date = max([r['start_date'] for r in self.reset_logs]) if self.reset_logs else self.investment_dates[0]
+            days_passed = (final_date - last_start_date).days
+            
+            annualized_return = self.calculate_annualized_return(
+                last_start_date, 
+                final_date, 
+                self.total_investment, 
+                self.current_value
+            )
+            
+            report.append("\n==== 当前持仓情况 ====")
+            report.append(f"- 投资期间: {last_start_date.date()} 到 {final_date.date()} ({days_passed}天)")
+            report.append(f"- 投资金额: {self.total_investment:.2f}元")
+            report.append(f"- 当前价值: {self.current_value:.2f}元")
+            report.append(f"- 持有份额: {self.units_held:.2f}份")
+            report.append(f"- 当前收益: {final_profit:.2f}元 ({final_profit_percentage:.2f}%)")
+            report.append(f"- 年化收益率: {annualized_return:.2f}%")
+        
+        report_text = '\n'.join(report)
+        
+        # 打印报告
+        if verbose:
+            print("\n" + report_text)
+        
+        # 保存报告
+        if save:
+            results_path = self.get_results_file_path("txt", threshold=self.profit_threshold)
+            with open(results_path, 'w', encoding='utf-8') as f:
+                f.write(report_text)
+            
+            print(f"投资汇总报告已保存至: {results_path}")
+        
+        # 返回汇总数据
+        return {
+            "total_profit": total_profit,
+            "overall_return": overall_return,
+            "num_resets": num_resets,
+            "avg_hold_days": avg_hold_days,
+            "total_investments": total_investments,
+            "current_profit": current_profit,
+            "detailed_report": report_text
+        }
+    
+    def plot_investment_results(self, threshold: Optional[float] = None):
+        """
+        绘制投资结果图表
+        
+        参数:
+            threshold: 收益率阈值，用于生成特定阈值的文件名
+        """
+        if not self.reset_logs and self.total_investment <= 0:
+            print("没有投资数据，无法生成图表")
+            return
+        
+        # 设置阈值标签
+        threshold = threshold or self.profit_threshold
+        threshold_label = f"{threshold*100}%"
+            
+        # 设置图表大小
+        plt.figure(figsize=(12, 10))
+        
+        # 绘制基金净值走势
+        plt.subplot(2, 1, 1)
+        plt.plot(self.fund_data['date'], self.fund_data['value'], 'b-', label='基金净值')
+        
+        # 标记卖出点
+        for reset in self.reset_logs:
+            plt.axvline(x=reset['end_date'], color='r', linestyle='--', alpha=0.7)
+            plt.scatter(reset['end_date'], self.fund_data[self.fund_data['date'] == reset['end_date']]['value'].values[0], 
+                     color='red', s=80, marker='v', zorder=5)
+            
+            # 添加收益率标注
+            plt.annotate(f"{reset['profit_percentage']:.1f}%", 
+                      (reset['end_date'], self.fund_data[self.fund_data['date'] == reset['end_date']]['value'].values[0]),
+                      xytext=(0, -30), textcoords='offset points',
+                      ha='center', va='center',
+                      bbox=dict(boxstyle='round,pad=0.5', fc='yellow', alpha=0.7))
+        
+        plt.title(f"{self.fund_info['fund_name']} ({self.fund_id}) - {threshold_label} 阈值策略", fontsize=14)
+        plt.ylabel("净值", fontsize=12)
+        plt.grid(True, alpha=0.3)
+        plt.legend(loc='best')
+        
+        # 绘制每次投资周期的收益率和持有天数
+        plt.subplot(2, 1, 2)
+        
+        # 组合数据
+        all_cycles = []
+        for reset in self.reset_logs:
+            all_cycles.append({
+                'end_date': reset['end_date'],
+                'profit_percentage': reset['profit_percentage'],
+                'duration': reset['duration_days'],
+                'is_current': False
+            })
+        
+        # 添加当前持仓
+        if self.total_investment > 0:
+            final_date = self.fund_data['date'].max()
+            last_start_date = max([r['start_date'] for r in self.reset_logs]) if self.reset_logs else self.investment_dates[0]
+            days_passed = (final_date - last_start_date).days
+            
+            current_profit_percentage = ((self.current_value - self.total_investment) / self.total_investment) * 100
+            
+            all_cycles.append({
+                'end_date': final_date,
+                'profit_percentage': current_profit_percentage,
+                'duration': days_passed,
+                'is_current': True
+            })
+        
+        if not all_cycles:  # 如果没有投资周期数据
+            plt.text(0.5, 0.5, '无投资周期数据', ha='center', va='center', transform=plt.gca().transAxes)
+        else:
+            # 提取数据
+            dates = [cycle['end_date'] for cycle in all_cycles]
+            profit_percentages = [cycle['profit_percentage'] for cycle in all_cycles]
+            durations = [cycle['duration'] for cycle in all_cycles]
+            is_current = [cycle['is_current'] for cycle in all_cycles]
+            
+            # 创建横条图表示持有天数
+            ax1 = plt.gca()
+            ax1.bar(dates, durations, width=10, color=['blue' if not current else 'green' for current in is_current], 
+                   alpha=0.6, label='持有天数')
+            ax1.set_ylabel("持有天数", fontsize=12)
+            
+            # 创建折线图表示收益率
+            ax2 = ax1.twinx()
+            ax2.plot(dates, profit_percentages, 'ro-', label='收益率(%)')
+            
+            # 标记阈值线
+            ax2.axhline(y=threshold*100, color='r', linestyle='--', alpha=0.7, 
+                       label=f"目标收益率 {threshold_label}")
+            
+            # 添加收益率标签
+            for i, (date, profit) in enumerate(zip(dates, profit_percentages)):
+                ax2.annotate(f"{profit:.1f}%", 
+                          (date, profit),
+                          xytext=(0, 10), textcoords='offset points',
+                          ha='center', va='bottom')
+            
+            # 设置标题和标签
+            plt.title(f"各周期收益率和持有天数 (阈值: {threshold_label})", fontsize=14)
+            ax2.set_ylabel("收益率 (%)", fontsize=12)
+            plt.xlabel("日期", fontsize=12)
+            plt.grid(True, alpha=0.3)
+            
+            # 合并图例
+            lines1, labels1 = ax1.get_legend_handles_labels()
+            lines2, labels2 = ax2.get_legend_handles_labels()
+            ax2.legend(lines1 + lines2, labels1 + labels2, loc='best')
+        
+        # 调整布局
+        plt.tight_layout()
+        
+        # 保存图表
+        results_path = self.get_results_file_path("png", threshold=threshold)
+        plt.savefig(results_path, dpi=300)
+        print(f"投资结果图表已保存至: {results_path}")
+        
+        plt.close()
+
+
+def analyze_multiple_thresholds(fund_id: str, investment_amount: float = 200, 
+                                min_threshold: float = 0.1, max_threshold: float = 1.0, 
+                                step: float = 0.1, refresh_data: bool = False,
+                                precision: int = 2) -> Dict:
+    """
+    分析多个收益阈值的投资效果，并找出收益最高的阈值
+    
+    参数:
+        fund_id: 基金代码
+        investment_amount: 每次定投金额
+        min_threshold: 最小收益阈值
+        max_threshold: 最大收益阈值
+        step: 阈值步长
+        refresh_data: 是否刷新基金数据
+        precision: 精度，在找到最佳阈值后，进一步细化搜索的精度
+    
+    返回:
+        dict: 各阈值的分析结果和最佳阈值
+    """
+    print(f"\n===== 开始分析不同收益阈值的投资效果 =====")
+    print(f"基金ID: {fund_id}")
+    print(f"每日定投金额: {investment_amount}元")
+    print(f"阈值范围: {min_threshold*100}% 到 {max_threshold*100}% (步长: {step*100}%)")
+    
+    # 生成待测试阈值列表
+    thresholds = np.arange(min_threshold, max_threshold + step/2, step)  # 添加step/2是为了解决浮点数误差
+    thresholds = [round(t, 2) for t in thresholds]  # 四舍五入到2位小数
+    
+    results = {}
+    
+    # 第一次创建对象时读取或获取数据
+    first_analysis = FundInvestment(fund_id, investment_amount, thresholds[0])
+    first_analysis.fund_data = first_analysis.load_fund_data(refresh=refresh_data)
+    
+    # 使用进度条显示分析进度
+    with tqdm(total=len(thresholds), desc="阈值分析进度 (第1轮)", ncols=100) as pbar:
+        for threshold in thresholds:
+            # 使用缓存的数据创建新的分析对象
+            analysis = FundInvestment(fund_id, investment_amount, threshold)
+            analysis._fund_data_cache = {fund_id: first_analysis.fund_data}
+            analysis.fund_info = first_analysis.fund_info
+            
+            # 执行投资策略分析
+            result_data = analysis.run_investment_strategy(verbose=False)
+            
+            # 记录结果
+            results[threshold] = result_data
+            
+            pbar.update(1)
+    
+    # 找出收益最高的阈值
+    best_threshold = max(results.items(), key=lambda x: x[1]["total_profit"])[0]
+    best_result = results[best_threshold]
+    
+    # 如果需要更高精度，在最佳阈值附近进一步搜索
+    if precision > 0:
+        refined_min = max(min_threshold, best_threshold - step)
+        refined_max = min(max_threshold, best_threshold + step)
+        refined_step = step / 5  # 使用更小的步长
+        
+        refined_thresholds = np.arange(refined_min, refined_max + refined_step/2, refined_step)
+        refined_thresholds = [round(t, 3) for t in refined_thresholds if t != best_threshold]  # 更高精度，排除已测试的阈值
+        
+        print(f"\n在 {refined_min*100}% 到 {refined_max*100}% 范围内进一步精确搜索最佳阈值...")
+        
+        # 第二轮搜索
+        with tqdm(total=len(refined_thresholds), desc="阈值分析进度 (第2轮)", ncols=100) as pbar:
+            for threshold in refined_thresholds:
+                analysis = FundInvestment(fund_id, investment_amount, threshold)
+                analysis._fund_data_cache = {fund_id: first_analysis.fund_data}
+                analysis.fund_info = first_analysis.fund_info
+                
+                result_data = analysis.run_investment_strategy(verbose=False)
+                results[threshold] = result_data
+                
+                if result_data["total_profit"] > best_result["total_profit"]:
+                    best_threshold = threshold
+                    best_result = result_data
+                
+                pbar.update(1)
+    
+    # 输出所有阈值的结果表格
+    print("\n===== 不同阈值分析结果 =====")
+    print("阈值\t总收益(元)\t收益率(%)\t卖出次数\t平均持有天数\t年化收益(%)")
+    print("-" * 80)
+    
+    # 按阈值排序并打印
+    sorted_results = sorted(results.items())
+    for threshold, data in sorted_results:
+        print(f"{threshold*100:5.1f}%\t{data['total_profit']:10.2f}\t{data['overall_return']:8.2f}%\t{data['num_resets']:8d}\t{data['avg_hold_days']:12.1f}\t{data.get('annualized_return', 0):12.2f}%")
+    
+    print("\n===== 最佳阈值 =====")
+    print(f"🏆 收益最高阈值: {best_threshold*100:.1f}%")
+    print(f"总收益: {best_result['total_profit']:.2f}元")
+    print(f"收益率: {best_result['overall_return']:.2f}%")
+    print(f"卖出次数: {best_result['num_resets']}")
+    print(f"平均持有天数: {best_result['avg_hold_days']:.1f}")
+    if 'annualized_return' in best_result:
+        print(f"年化收益率: {best_result['annualized_return']:.2f}%")
+    
+    # 保存结果为CSV
+    df = pd.DataFrame([
+        {
+            "threshold": t*100,
+            "total_profit": data["total_profit"],
+            "overall_return": data["overall_return"],
+            "num_resets": data["num_resets"],
+            "avg_hold_days": data["avg_hold_days"],
+            "annualized_return": data.get("annualized_return", 0)
+        }
+        for t, data in results.items()
+    ])
+    
+    results_path = os.path.join("investment_results", f"fund_{fund_id}_threshold_comparison.csv")
+    df.to_csv(results_path, index=False)
+    print(f"\n各阈值对比结果已保存至: {results_path}")
+    
+    # 绘制对比图
+    plot_threshold_comparison(fund_id, results)
+    
+    # 对最佳阈值生成详细报告
+    print("\n为最佳阈值生成详细报告...")
+    best_analysis = FundInvestment(fund_id, investment_amount, best_threshold)
+    best_analysis._fund_data_cache = {fund_id: first_analysis.fund_data}
+    best_analysis.fund_info = first_analysis.fund_info
+    best_analysis.run_investment_strategy(verbose=True)
+    
+    return {
+        "results": results,
+        "best_threshold": best_threshold,
+        "best_result": best_result
+    }
+
+
+def plot_threshold_comparison(fund_id: str, results: Dict):
+    """
+    绘制不同阈值效果对比图
+    
+    参数:
+        fund_id: 基金代码
+        results: 各阈值的分析结果
+    """
+    # 提取数据
+    sorted_results = sorted(results.items())
+    thresholds = [k*100 for k, _ in sorted_results]  # 转换为百分比形式
+    profits = [v["total_profit"] for _, v in sorted_results]
+    returns = [v["overall_return"] for _, v in sorted_results]
+    num_resets = [v["num_resets"] for _, v in sorted_results]
+    avg_hold_days = [v["avg_hold_days"] for _, v in sorted_results]
+    
+    # 找出最佳阈值
+    best_idx = profits.index(max(profits))
+    
+    # 创建图表
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    
+    # 1. 绘制总收益对比
+    bars1 = axes[0, 0].bar(range(len(thresholds)), profits, color=['royalblue' if i != best_idx else 'gold' for i in range(len(thresholds))])
+    axes[0, 0].set_ylabel('总收益 (元)', fontsize=12)
+    axes[0, 0].set_title('不同阈值的总收益对比', fontsize=14)
+    axes[0, 0].set_xticks(range(len(thresholds)))
+    axes[0, 0].set_xticklabels([f"{t}%" for t in thresholds], rotation=45)
+    axes[0, 0].grid(axis='y', alpha=0.3)
+    
+    # 添加收益数值标签
+    for bar in bars1:
+        height = bar.get_height()
+        axes[0, 0].annotate(f'{height:.2f}',
+                         xy=(bar.get_x() + bar.get_width() / 2, height),
+                         xytext=(0, 3),
+                         textcoords="offset points",
+                         ha='center', va='bottom',
+                         fontsize=9)
+    
+    # 2. 绘制收益率对比
+    bars2 = axes[0, 1].bar(range(len(thresholds)), returns, color=['green' if i != best_idx else 'gold' for i in range(len(thresholds))])
+    axes[0, 1].set_ylabel('收益率 (%)', fontsize=12)
+    axes[0, 1].set_title('不同阈值的收益率对比', fontsize=14)
+    axes[0, 1].set_xticks(range(len(thresholds)))
+    axes[0, 1].set_xticklabels([f"{t}%" for t in thresholds], rotation=45)
+    axes[0, 1].grid(axis='y', alpha=0.3)
+    
+    # 添加收益率数值标签
+    for bar in bars2:
+        height = bar.get_height()
+        axes[0, 1].annotate(f'{height:.2f}%',
+                         xy=(bar.get_x() + bar.get_width() / 2, height),
+                         xytext=(0, 3),
+                         textcoords="offset points",
+                         ha='center', va='bottom',
+                         fontsize=9)
+    
+    # 3. 绘制卖出次数对比
+    bars3 = axes[1, 0].bar(range(len(thresholds)), num_resets, color=['purple' if i != best_idx else 'gold' for i in range(len(thresholds))])
+    axes[1, 0].set_ylabel('卖出次数', fontsize=12)
+    axes[1, 0].set_title('不同阈值的卖出次数对比', fontsize=14)
+    axes[1, 0].set_xlabel('收益阈值', fontsize=12)
+    axes[1, 0].set_xticks(range(len(thresholds)))
+    axes[1, 0].set_xticklabels([f"{t}%" for t in thresholds], rotation=45)
+    axes[1, 0].grid(axis='y', alpha=0.3)
+    
+    # 添加卖出次数标签
+    for bar in bars3:
+        height = bar.get_height()
+        axes[1, 0].annotate(f'{height:.0f}',
+                         xy=(bar.get_x() + bar.get_width() / 2, height),
+                         xytext=(0, 3),
+                         textcoords="offset points",
+                         ha='center', va='bottom',
+                         fontsize=9)
+    
+    # 4. 绘制平均持有天数对比
+    bars4 = axes[1, 1].bar(range(len(thresholds)), avg_hold_days, color=['orange' if i != best_idx else 'gold' for i in range(len(thresholds))])
+    axes[1, 1].set_ylabel('平均持有天数', fontsize=12)
+    axes[1, 1].set_title('不同阈值的平均持有天数对比', fontsize=14)
+    axes[1, 1].set_xlabel('收益阈值', fontsize=12)
+    axes[1, 1].set_xticks(range(len(thresholds)))
+    axes[1, 1].set_xticklabels([f"{t}%" for t in thresholds], rotation=45)
+    axes[1, 1].grid(axis='y', alpha=0.3)
+    
+    # 添加平均持有天数标签
+    for bar in bars4:
+        height = bar.get_height()
+        axes[1, 1].annotate(f'{height:.1f}',
+                         xy=(bar.get_x() + bar.get_width() / 2, height),
+                         xytext=(0, 3),
+                         textcoords="offset points",
+                         ha='center', va='bottom',
+                         fontsize=9)
+    
+    # 添加整体标题
+    plt.suptitle(f'基金 {fund_id} - 不同阈值投资策略对比分析\n最佳阈值: {thresholds[best_idx]}%', fontsize=16)
+    
+    # 调整布局
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    
+    # 保存图表
+    results_path = os.path.join("investment_results", f"fund_{fund_id}_threshold_comparison.png")
+    plt.savefig(results_path, dpi=300)
+    print(f"阈值对比图已保存至: {results_path}")
+    
+    plt.close()
+
+
+def find_optimal_thresholds(fund_id: str, investment_amount: float = 200, 
+                           refresh_data: bool = False):
+    """
+    找出基金的最佳收益阈值
+    
+    参数:
+        fund_id: 基金代码
+        investment_amount: 每次定投金额
+        refresh_data: 是否刷新基金数据
+        
+    执行三轮搜索:
+    1. 粗搜索: 10% 到 100%，步长 10%
+    2. 中搜索: 在粗搜索最佳阈值附近，步长 2%
+    3. 精搜索: 在中搜索最佳阈值附近，步长 0.5%
+    """
+    print(f"===== 开始寻找基金 {fund_id} 的最佳收益阈值 =====")
+    
+    # 第一轮: 粗搜索 (10%-100%, 步长10%)
+    print("\n🔍 第一轮: 粗搜索 (10%-100%, 步长10%)")
+    first_round = analyze_multiple_thresholds(
+        fund_id=fund_id,
+        investment_amount=investment_amount,
+        min_threshold=0.1,
+        max_threshold=1.0,
+        step=0.1,
+        refresh_data=refresh_data,
+        precision=0  # 不进行额外精确搜索
+    )
+    
+    best_threshold_1 = first_round["best_threshold"]
+    
+    # 第二轮: 中搜索 (最佳阈值±15%, 步长2%)
+    min_threshold_2 = max(0.05, best_threshold_1 - 0.15)
+    max_threshold_2 = min(1.0, best_threshold_1 + 0.15)
+    
+    print(f"\n🔍 第二轮: 中搜索 ({min_threshold_2*100:.0f}%-{max_threshold_2*100:.0f}%, 步长2%)")
+    second_round = analyze_multiple_thresholds(
+        fund_id=fund_id,
+        investment_amount=investment_amount,
+        min_threshold=min_threshold_2,
+        max_threshold=max_threshold_2,
+        step=0.02,
+        refresh_data=False,  # 使用缓存数据
+        precision=0  # 不进行额外精确搜索
+    )
+    
+    best_threshold_2 = second_round["best_threshold"]
+    
+    # 第三轮: 精搜索 (最佳阈值±3%, 步长0.5%)
+    min_threshold_3 = max(0.01, best_threshold_2 - 0.03)
+    max_threshold_3 = min(1.0, best_threshold_2 + 0.03)
+    
+    print(f"\n🔍 第三轮: 精搜索 ({min_threshold_3*100:.1f}%-{max_threshold_3*100:.1f}%, 步长0.5%)")
+    third_round = analyze_multiple_thresholds(
+        fund_id=fund_id,
+        investment_amount=investment_amount,
+        min_threshold=min_threshold_3,
+        max_threshold=max_threshold_3,
+        step=0.005,
+        refresh_data=False,  # 使用缓存数据
+        precision=0  # 不进行额外精确搜索
+    )
+    
+    final_best_threshold = third_round["best_threshold"]
+    final_best_result = third_round["best_result"]
+    
+    # 整理所有搜索结果
+    all_results = {}
+    all_results.update(first_round["results"])
+    all_results.update(second_round["results"])
+    all_results.update(third_round["results"])
+    
+    # 创建最终汇总图表
+    plot_threshold_comparison(fund_id, all_results)
+    
+    print("\n===== 基金最佳收益阈值搜索完成 =====")
+    print(f"🏆 最终最佳阈值: {final_best_threshold*100:.2f}%")
+    print(f"总收益: {final_best_result['total_profit']:.2f}元")
+    print(f"收益率: {final_best_result['overall_return']:.2f}%")
+    print(f"卖出次数: {final_best_result['num_resets']}")
+    print(f"平均持有天数: {final_best_result['avg_hold_days']:.1f}")
+    
+    # 将所有结果保存为CSV
+    df = pd.DataFrame([
+        {
+            "threshold": t*100,
+            "total_profit": data["total_profit"],
+            "overall_return": data["overall_return"],
+            "num_resets": data["num_resets"],
+            "avg_hold_days": data["avg_hold_days"],
+            "annualized_return": data.get("annualized_return", 0)
+        }
+        for t, data in sorted(all_results.items())
+    ])
+    
+    results_path = os.path.join("investment_results", f"fund_{fund_id}_all_thresholds.csv")
+    df.to_csv(results_path, index=False)
+    print(f"\n所有阈值分析结果已保存至: {results_path}")
+    
+    # 生成最佳阈值的详细报告
+    print("\n为最终最佳阈值生成详细报告...")
+    best_analysis = FundInvestment(fund_id, investment_amount, final_best_threshold)
+    
+    # 使用缓存数据
+    first_obj = FundInvestment(fund_id, investment_amount, 0.1)
+    first_obj.fund_data = first_obj.load_fund_data(refresh=False)
+    best_analysis._fund_data_cache = {fund_id: first_obj.fund_data}
+    best_analysis.fund_info = first_obj.fund_info
+    
+    best_analysis.run_investment_strategy(verbose=True)
+    
+    return final_best_threshold
+
+
+def main():
+    """主函数"""
+    
+    # 解析命令行参数
+    parser = argparse.ArgumentParser(description="基金定投收益分析工具")
+    parser.add_argument('--fund-id', type=str, default='004997', help='基金ID')
+    parser.add_argument('--amount', type=float, default=200, help='每次定投金额(元)')
+    parser.add_argument('--threshold', type=float, help='收益率阈值(百分比)，不指定则执行最佳阈值搜索')
+    parser.add_argument('--refresh', action='store_true', help='强制刷新基金数据')
+    parser.add_argument('--optimize', action='store_true', help='执行三轮优化搜索，找出最佳阈值')
+    
+    args = parser.parse_args()
+    
+    print("===== 基金定投收益分析 =====")
+    print(f"基金ID: {args.fund_id}")
+    print(f"定投金额: {args.amount} 元")
+    
+    # 确保目录存在
+    for directory in ["fund_data", "investment_results"]:
+        if not os.path.exists(directory):
+            os.makedirs(directory)
+    
+    # 如果指定了阈值，则只分析该阈值
+    if args.threshold is not None:
+        threshold = args.threshold / 100  # 转换为小数
+        print(f"收益阈值: {args.threshold}%")
+        
+        fund_investment = FundInvestment(
+            fund_id=args.fund_id,
+            investment_amount=args.amount,
+            profit_threshold=threshold
+        )
+        
+        # 加载数据
+        fund_investment.fund_data = fund_investment.load_fund_data(refresh=args.refresh)
+        
+        # 运行投资策略
+        fund_investment.run_investment_strategy()
+    
+    # 如果指定了优化选项，执行三轮搜索
+    elif args.optimize:
+        find_optimal_thresholds(
+            fund_id=args.fund_id,
+            investment_amount=args.amount,
+            refresh_data=args.refresh
+        )
+    
+    else:
+        # 执行标准的多阈值分析
+        analyze_multiple_thresholds(
+            fund_id=args.fund_id,
+            investment_amount=args.amount,
+            min_threshold=0.1,
+            max_threshold=1.0,
+            step=0.1,
+            refresh_data=args.refresh,
+            precision=1  # 进行一轮更精确的搜索
+        )
+
+
+if __name__ == "__main__":
+    main()
