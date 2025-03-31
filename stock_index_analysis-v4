@@ -1,0 +1,1212 @@
+import akshare as ak
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import mplfinance as mpf
+from datetime import datetime, timedelta
+import seaborn as sns
+import warnings
+import base64
+from io import BytesIO
+from jinja2 import Template
+import os
+import logging
+import traceback
+
+# 设置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    filename='stock_analysis.log'
+)
+logger = logging.getLogger('stock_analysis')
+
+# 忽略特定警告
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
+
+# 设置matplotlib中文显示
+plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans', 'Arial Unicode MS']
+plt.rcParams['axes.unicode_minus'] = False
+plt.rcParams['figure.figsize'] = [14, 8]
+plt.rcParams['figure.dpi'] = 100
+plt.style.use('ggplot')
+
+# 设置seaborn风格
+sns.set_style("whitegrid")
+
+# 指数代码映射
+indices = {
+    '上证指数': 'sh000001',
+    '深证成指': 'sz399001',
+    '创业板指': 'sz399006'
+}
+
+
+def safe_get_data(code, name, days=120):
+    """安全获取数据，包含错误处理"""
+    try:
+        logger.info(f"开始获取{name}数据")
+        df = ak.stock_zh_index_daily(symbol=code)
+        
+        if df is None or df.empty:
+            logger.error(f"获取{name}数据失败，返回结果为空")
+            return None
+        
+        logger.info(f"成功获取{name}数据: {len(df)}行")
+        return df
+    except ConnectionError:
+        logger.error(f"获取{name}数据时网络连接失败")
+        return None
+    except Exception as e:
+        logger.error(f"获取{name}数据时发生错误: {e.__class__.__name__}: {e}")
+        logger.error(traceback.format_exc())
+        return None
+
+
+def preprocess_data(df, start_date=None):
+    """数据预处理和清洗"""
+    if df is None or df.empty:
+        return None
+    
+    # 确保日期列是datetime类型
+    df['date'] = pd.to_datetime(df['date'])
+    
+    # 按日期排序
+    df = df.sort_values('date')
+    
+    # 筛选日期范围
+    if start_date:
+        df = df[df['date'] >= start_date]
+    
+    # 处理缺失值
+    df = df.dropna(subset=['open', 'high', 'low', 'close', 'volume'])
+    
+    # 处理异常值(使用3倍标准差法)
+    for col in ['open', 'high', 'low', 'close']:
+        mean = df[col].mean()
+        std = df[col].std()
+        df = df[(df[col] > mean - 3*std) & (df[col] < mean + 3*std)]
+    
+    # 计算日回报率
+    df['daily_return'] = df['close'].pct_change() * 100
+    
+    # 计算归一化值，便于比较
+    df['normalized'] = df['close'] / df['close'].iloc[0]
+    
+    return df
+
+
+def calculate_indicators(df):
+    """计算所有技术指标"""
+    if df is None or df.empty:
+        return None
+    
+    # 移动平均线
+    df['MA5'] = df['close'].rolling(window=5).mean()
+    df['MA10'] = df['close'].rolling(window=10).mean()
+    df['MA20'] = df['close'].rolling(window=20).mean()
+    df['MA30'] = df['close'].rolling(window=30).mean()
+    df['MA60'] = df['close'].rolling(window=60).mean()
+    df['MA120'] = df['close'].rolling(window=120).mean()
+    
+    # 成交量均线
+    df['VOL_MA5'] = df['volume'].rolling(window=5).mean()
+    df['VOL_MA10'] = df['volume'].rolling(window=10).mean()
+    df['VOL_MA20'] = df['volume'].rolling(window=20).mean()
+    
+    # RSI指标(相对强弱指数)
+    delta = df['close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    df['RSI'] = 100 - (100 / (1 + rs))
+    
+    # MACD指标
+    exp1 = df['close'].ewm(span=12, adjust=False).mean()
+    exp2 = df['close'].ewm(span=26, adjust=False).mean()
+    df['MACD'] = exp1 - exp2
+    df['MACD_SIGNAL'] = df['MACD'].ewm(span=9, adjust=False).mean()
+    df['MACD_HIST'] = df['MACD'] - df['MACD_SIGNAL']
+    
+    # 布林带
+    df['BOLL_MID'] = df['close'].rolling(window=20).mean()
+    df['BOLL_STD'] = df['close'].rolling(window=20).std()
+    df['BOLL_UPPER'] = df['BOLL_MID'] + 2 * df['BOLL_STD']
+    df['BOLL_LOWER'] = df['BOLL_MID'] - 2 * df['BOLL_STD']
+    df['BOLL_WIDTH'] = (df['BOLL_UPPER'] - df['BOLL_LOWER']) / df['BOLL_MID']
+    
+    # ATR - 真实波幅
+    df['TR'] = np.maximum(
+        np.maximum(
+            df['high'] - df['low'],
+            np.abs(df['high'] - df['close'].shift(1))
+        ),
+        np.abs(df['low'] - df['close'].shift(1))
+    )
+    df['ATR'] = df['TR'].rolling(window=14).mean()
+    
+    # 计算KDJ
+    low_min = df['low'].rolling(window=9).min()
+    high_max = df['high'].rolling(window=9).max()
+    df['RSV'] = (df['close'] - low_min) / (high_max - low_min) * 100
+    df['K'] = df['RSV'].rolling(window=3).mean()
+    df['D'] = df['K'].rolling(window=3).mean()
+    df['J'] = 3 * df['K'] - 2 * df['D']
+    
+    # 计算均线斜率
+    df['MA20_SLOPE'] = df['MA20'].diff(5) / 5
+    
+    return df
+
+
+def analyze_risk_metrics(returns):
+    """计算风险指标"""
+    metrics = {}
+    
+    # 去除NaN值
+    clean_returns = returns.dropna()
+    
+    if len(clean_returns) < 2:
+        return {
+            'daily_volatility': None,
+            'annual_volatility': None,
+            'max_drawdown': None,
+            'sharpe_ratio': None,
+            'calmar_ratio': None,
+            'sortino_ratio': None
+        }
+    
+    # 日波动率
+    metrics['daily_volatility'] = clean_returns.std()
+    
+    # 年化波动率
+    metrics['annual_volatility'] = clean_returns.std() * np.sqrt(252)
+    
+    # 最大回撤
+    cum_returns = (1 + clean_returns/100).cumprod()
+    running_max = cum_returns.cummax()
+    drawdown = (cum_returns / running_max - 1) * 100
+    metrics['max_drawdown'] = drawdown.min()
+    
+    # 夏普比率
+    risk_free_rate = 0.02 / 252  # 假设年化无风险利率2%
+    excess_return = clean_returns.mean() - risk_free_rate
+    metrics['sharpe_ratio'] = excess_return / clean_returns.std() * np.sqrt(252) if clean_returns.std() != 0 else 0
+    
+    # 卡玛比率
+    annual_return = (1 + clean_returns/100).prod() ** (252/len(clean_returns)) - 1
+    metrics['calmar_ratio'] = annual_return / (abs(metrics['max_drawdown'])/100) if metrics['max_drawdown'] < 0 else 0
+    
+    # 索提诺比率
+    downside_returns = clean_returns[clean_returns < 0]
+    downside_deviation = downside_returns.std() * np.sqrt(252) if len(downside_returns) > 0 else np.nan
+    metrics['sortino_ratio'] = excess_return * np.sqrt(252) / downside_deviation if not np.isnan(downside_deviation) and downside_deviation != 0 else 0
+    
+    return metrics
+
+
+def get_market_sentiment():
+    """获取市场情绪指标"""
+    try:
+        # 获取北向资金数据(最近10个交易日)
+        north_money = ak.stock_em_hsgt_north_net_flow_in()
+        recent_flow = north_money.iloc[-5:]['net_flow_in'].sum()
+        
+        # 计算市场情绪得分(简单示例)
+        sentiment_score = 0
+        if recent_flow > 0:
+            sentiment_score += 1
+        else:
+            sentiment_score -= 1
+        
+        sentiment = "中性"
+        if sentiment_score > 0:
+            sentiment = "偏乐观"
+        elif sentiment_score < 0:
+            sentiment = "偏谨慎"
+            
+        return {
+            'sentiment': sentiment,
+            'north_flow': recent_flow,
+            'description': f"市场情绪: {sentiment} (北向资金近5日净流入{recent_flow:.2f}亿)"
+        }
+    except Exception as e:
+        logger.error(f"获取市场情绪数据时发生错误: {e}")
+        return {
+            'sentiment': '未知',
+            'north_flow': 0,
+            'description': "无法获取市场情绪数据"
+        }
+
+
+def backtest_simple_strategy(df, short_window=5, long_window=20):
+    """简单的均线交叉策略回测"""
+    # 确保指标已经计算
+    if f'MA{short_window}' not in df.columns or f'MA{long_window}' not in df.columns:
+        df[f'MA{short_window}'] = df['close'].rolling(window=short_window).mean()
+        df[f'MA{long_window}'] = df['close'].rolling(window=long_window).mean()
+    
+    # 生成交易信号
+    df['signal'] = 0
+    df.loc[df[f'MA{short_window}'] > df[f'MA{long_window}'], 'signal'] = 1  # 做多信号
+    df.loc[df[f'MA{short_window}'] < df[f'MA{long_window}'], 'signal'] = -1  # 做空信号(或观望)
+    
+    # 生成交易
+    df['position'] = df['signal'].shift(1)  # 下一天才能交易
+    df['position'].fillna(0, inplace=True)
+    
+    # 计算策略收益
+    df['strategy_return'] = df['position'] * df['daily_return']
+    
+    # 计算累积收益
+    df['cum_market_return'] = (1 + df['daily_return']/100).cumprod() - 1
+    df['cum_strategy_return'] = (1 + df['strategy_return']/100).cumprod() - 1
+    
+    # 计算风险指标
+    market_metrics = analyze_risk_metrics(df['daily_return'])
+    strategy_metrics = analyze_risk_metrics(df['strategy_return'])
+    
+    # 计算胜率
+    df['trade'] = df['position'].diff().fillna(0)
+    trades = df.loc[(df['trade'] != 0)]
+    if len(trades) > 0:
+        winning_trades = len(trades[trades['strategy_return'] > 0])
+        win_rate = winning_trades / len(trades)
+    else:
+        win_rate = 0
+        
+    results = {
+        'period': f"{df['date'].iloc[0].strftime('%Y-%m-%d')} 到 {df['date'].iloc[-1].strftime('%Y-%m-%d')}",
+        'strategy_return': df['cum_strategy_return'].iloc[-1] * 100,
+        'market_return': df['cum_market_return'].iloc[-1] * 100,
+        'alpha': (df['cum_strategy_return'].iloc[-1] - df['cum_market_return'].iloc[-1]) * 100,
+        'win_rate': win_rate * 100,
+        'strategy_metrics': strategy_metrics,
+        'market_metrics': market_metrics,
+        'backtest_data': df
+    }
+    
+    return results
+
+
+def optimize_parameters(df, param_grid):
+    """使用网格搜索寻找最优参数"""
+    best_score = -np.inf
+    best_params = None
+    results = []
+    
+    # 确保close和daily_return列存在
+    if 'daily_return' not in df.columns:
+        df['daily_return'] = df['close'].pct_change() * 100
+    
+    for short_window in param_grid['short_window']:
+        for long_window in param_grid['long_window']:
+            if short_window >= long_window:
+                continue  # 短期窗口必须小于长期窗口
+            
+            params = {'short_window': short_window, 'long_window': long_window}
+            backtest = backtest_simple_strategy(df.copy(), short_window, long_window)
+            sharpe = backtest['strategy_metrics']['sharpe_ratio']
+            
+            results.append({
+                'short_window': short_window,
+                'long_window': long_window,
+                'return': backtest['strategy_return'],
+                'sharpe': sharpe,
+                'drawdown': backtest['strategy_metrics']['max_drawdown']
+            })
+            
+            if not np.isnan(sharpe) and sharpe > best_score:
+                best_score = sharpe
+                best_params = params
+                
+    results_df = pd.DataFrame(results)
+    
+    return best_params, best_score, results_df
+
+
+def analyze_indicators_confluence(df):
+    """分析多个指标的共振效应"""
+    if df is None or len(df) < 60:
+        return "数据不足，无法完成指标共振分析"
+    
+    latest = df.iloc[-1]
+    bullish_signals = 0
+    bearish_signals = 0
+    neutral_signals = 0
+    signals = []
+    
+    # 1. 均线多头/空头排列
+    if latest['MA5'] > latest['MA10'] > latest['MA20']:
+        bullish_signals += 1
+        signals.append("均线呈多头排列(MA5>MA10>MA20)")
+    elif latest['MA5'] < latest['MA10'] < latest['MA20']:
+        bearish_signals += 1
+        signals.append("均线呈空头排列(MA5<MA10<MA20)")
+    else:
+        neutral_signals += 1
+        signals.append("均线无明确排列")
+    
+    # 2. 价格与均线关系
+    if latest['close'] > latest['MA60']:
+        bullish_signals += 1
+        signals.append("价格运行在长期均线MA60上方")
+    else:
+        bearish_signals += 1
+        signals.append("价格运行在长期均线MA60下方")
+    
+    # 3. MACD指标
+    if latest['MACD'] > latest['MACD_SIGNAL'] and latest['MACD_HIST'] > 0:
+        bullish_signals += 1
+        signals.append("MACD金叉形态")
+    elif latest['MACD'] < latest['MACD_SIGNAL'] and latest['MACD_HIST'] < 0:
+        bearish_signals += 1
+        signals.append("MACD死叉形态")
+    else:
+        neutral_signals += 1
+        signals.append("MACD处于中性状态")
+    
+    # 4. KDJ指标
+    if latest['K'] > latest['D'] and latest['J'] > 50:
+        bullish_signals += 1
+        signals.append("KDJ指标金叉且J值>50")
+    elif latest['K'] < latest['D'] and latest['J'] < 50:
+        bearish_signals += 1
+        signals.append("KDJ指标死叉且J值<50")
+    else:
+        neutral_signals += 1
+        signals.append("KDJ指标处于中性状态")
+    
+    # 5. RSI指标
+    if latest['RSI'] > 70:
+        bearish_signals += 0.5  # 超买可能导致回调，但不一定是卖出信号
+        signals.append("RSI超买(>70)")
+    elif latest['RSI'] < 30:
+        bullish_signals += 0.5  # 超卖可能带来反弹，但不一定是买入信号
+        signals.append("RSI超卖(<30)")
+    elif latest['RSI'] > 50 and latest['RSI'] < 70:
+        bullish_signals += 0.5
+        signals.append("RSI处于强势区间(50-70)")
+    elif latest['RSI'] > 30 and latest['RSI'] < 50:
+        bearish_signals += 0.5
+        signals.append("RSI处于弱势区间(30-50)")
+    
+    # 6. 布林带
+    if latest['close'] > latest['BOLL_UPPER']:
+        bearish_signals += 0.5  # 突破上轨，可能继续上涨，也可能回调
+        signals.append("价格突破布林上轨，关注可能回调")
+    elif latest['close'] < latest['BOLL_LOWER']:
+        bullish_signals += 0.5  # 突破下轨，可能继续下跌，也可能反弹
+        signals.append("价格突破布林下轨，关注可能反弹")
+    elif latest['close'] > latest['BOLL_MID'] and latest['close'] < latest['BOLL_UPPER']:
+        bullish_signals += 0.5
+        signals.append("价格在布林带上半轨，偏强势")
+    elif latest['close'] < latest['BOLL_MID'] and latest['close'] > latest['BOLL_LOWER']:
+        bearish_signals += 0.5
+        signals.append("价格在布林带下半轨，偏弱势")
+    
+    # 7. 成交量分析
+    recent_vol = df['volume'].iloc[-5:].mean()
+    prev_vol = df['volume'].iloc[-10:-5].mean()
+    vol_change = (recent_vol / prev_vol - 1) * 100
+    
+    if vol_change > 30 and latest['close'] > df['close'].iloc[-6]:
+        bullish_signals += 1
+        signals.append(f"量价齐升(成交量增加{vol_change:.1f}%)")
+    elif vol_change > 30 and latest['close'] < df['close'].iloc[-6]:
+        bearish_signals += 0.5
+        signals.append(f"量增价跌(成交量增加{vol_change:.1f}%)，可能是主力出货")
+    elif vol_change < -30 and latest['close'] < df['close'].iloc[-6]:
+        bearish_signals += 1
+        signals.append(f"量价齐跌(成交量减少{abs(vol_change):.1f}%)")
+    elif vol_change < -30 and latest['close'] > df['close'].iloc[-6]:
+        bullish_signals += 0.5
+        signals.append(f"量减价升(成交量减少{abs(vol_change):.1f}%)，需要观察是否有后续跟进")
+    
+    # 8. 市场宽度
+    # (实际使用时，可以添加市场宽度指标，如涨跌股票家数比例等)
+    
+    # 计算多空综合得分(0-100)
+    total_signals = bullish_signals + bearish_signals + neutral_signals
+    if total_signals == 0:
+        score = 50  # 中性
+    else:
+        # 将得分从[0, bullish/(bullish+bearish)]映射到[0,100]
+        score = bullish_signals / total_signals * 100
+    
+    # 形成结论
+    confluence_result = {
+        'bullish_signals': bullish_signals,
+        'bearish_signals': bearish_signals,
+        'neutral_signals': neutral_signals,
+        'score': score,
+        'signals': signals,
+        'conclusion': ""
+    }
+    
+    if score >= 75:
+        confluence_result['conclusion'] = f"强烈多头信号 (得分:{score:.1f}/100) - 多头指标明显占优"
+    elif score >= 60:
+        confluence_result['conclusion'] = f"偏多头信号 (得分:{score:.1f}/100) - 多头指标略占优势"
+    elif score >= 40:
+        confluence_result['conclusion'] = f"中性信号 (得分:{score:.1f}/100) - 多空指标各有表现"
+    elif score >= 25:
+        confluence_result['conclusion'] = f"偏空头信号 (得分:{score:.1f}/100) - 空头指标略占优势"
+    else:
+        confluence_result['conclusion'] = f"强烈空头信号 (得分:{score:.1f}/100) - 空头指标明显占优"
+    
+    return confluence_result
+
+
+def plot_normalized_indices(all_data):
+    """绘制归一化指数对比图"""
+    plt.figure(figsize=(12, 6))
+    
+    for name, df in all_data.items():
+        if df is not None and not df.empty:
+            plt.plot(df['date'], df['normalized'], label=name, linewidth=2)
+    
+    plt.title('三大指数走势对比(归一化)', fontsize=15)
+    plt.xlabel('日期', fontsize=12)
+    plt.ylabel('归一化价格(起始值=1)', fontsize=12)
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.legend(loc='best', fontsize=12)
+    
+    # 设置日期格式
+    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%m-%d'))
+    plt.gca().xaxis.set_major_locator(mdates.WeekdayLocator(byweekday=mdates.MO))  # 每周一标记
+    plt.xticks(rotation=45)
+    
+    plt.tight_layout()
+    
+    # 保存图片为BytesIO对象，用于在HTML报告中使用
+    buffer = BytesIO()
+    plt.savefig(buffer, format='png')
+    buffer.seek(0)
+    image_base64 = base64.b64encode(buffer.read()).decode('utf-8')
+    plt.close()
+    
+    return image_base64
+
+
+def plot_volume_comparison(all_data):
+    """绘制成交量对比图"""
+    plt.figure(figsize=(12, 5))
+    
+    for name, df in all_data.items():
+        if df is not None and not df.empty:
+            plt.bar(df['date'], df['volume']/10**8, label=f"{name}成交量", alpha=0.7)
+    
+    plt.title('三大指数成交量对比(亿手)', fontsize=15)
+    plt.xlabel('日期', fontsize=12)
+    plt.ylabel('成交量(亿手)', fontsize=12)
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.legend(loc='best', fontsize=12)
+    
+    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%m-%d'))
+    plt.gca().xaxis.set_major_locator(mdates.WeekdayLocator(byweekday=mdates.MO))
+    plt.xticks(rotation=45)
+    
+    plt.tight_layout()
+    
+    buffer = BytesIO()
+    plt.savefig(buffer, format='png')
+    buffer.seek(0)
+    image_base64 = base64.b64encode(buffer.read()).decode('utf-8')
+    plt.close()
+    
+    return image_base64
+
+
+def plot_technical_chart(df, name):
+    """绘制带技术指标的专业图表"""
+    if df is None or df.empty:
+        return None
+    
+    # 准备mpf需要的数据格式
+    df_mpf = df.copy()
+    df_mpf = df_mpf.set_index('date')
+    
+    # 选择最近60个交易日的数据
+    df_mpf = df_mpf.iloc[-60:]
+    
+    # 将数据转换为适合mplfinance的格式
+    df_mpf = df_mpf[['open', 'high', 'low', 'close', 'volume']]
+    
+    # 计算附加指标用于绘图
+    ma5 = df_mpf['close'].rolling(window=5).mean()
+    ma20 = df_mpf['close'].rolling(window=20).mean()
+    ma60 = df_mpf['close'].rolling(window=60).mean()
+    upper = ma20 + 2 * df_mpf['close'].rolling(window=20).std()
+    lower = ma20 - 2 * df_mpf['close'].rolling(window=20).std()
+    
+    # 设置附加指标
+    apds = [
+        mpf.make_addplot(ma5, color='blue', label='MA5'),
+        mpf.make_addplot(ma20, color='red', label='MA20'),
+        mpf.make_addplot(ma60, color='green', label='MA60'),
+        mpf.make_addplot(upper, color='gray', linestyle='dashed', label='BOLL上轨'),
+        mpf.make_addplot(lower, color='gray', linestyle='dashed', label='BOLL下轨')
+    ]
+    
+    # 创建图表
+    fig, axes = mpf.plot(
+        df_mpf,
+        type='candle',
+        style='yahoo',
+        title=f'{name}近期K线图(附带技术指标)',
+        ylabel='价格',
+        volume=True,
+        figsize=(12, 8),
+        returnfig=True,
+        addplot=apds
+    )
+    
+    # 添加图例
+    axes[0].legend(loc='upper left')
+    
+    # 保存为base64编码的图像
+    buffer = BytesIO()
+    fig.savefig(buffer, format='png')
+    buffer.seek(0)
+    image_base64 = base64.b64encode(buffer.read()).decode('utf-8')
+    plt.close(fig)
+    
+    return image_base64
+
+
+def plot_backtest_results(backtest_result, name):
+    """绘制回测结果图"""
+    plt.figure(figsize=(12, 6))
+    
+    df = backtest_result['backtest_data']
+    plt.plot(df['date'], (1+df['cum_market_return'])*100, label='指数表现', color='blue')
+    plt.plot(df['date'], (1+df['cum_strategy_return'])*100, label='策略表现', color='red')
+    plt.axhline(y=100, color='black', linestyle='--', alpha=0.3)
+    
+    plt.title(f'{name} - 均线策略回测结果', fontsize=15)
+    plt.xlabel('日期', fontsize=12)
+    plt.ylabel('收益率 (%)', fontsize=12)
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.legend(loc='best', fontsize=12)
+    
+    # 标记买入点和卖出点
+    buy_signals = df[df['signal'] > df['signal'].shift(1)]
+    sell_signals = df[df['signal'] < df['signal'].shift(1)]
+    
+    plt.scatter(buy_signals['date'], 
+                (1+buy_signals['cum_strategy_return'])*100, 
+                marker='^', color='green', s=100, label='买入信号')
+    
+    plt.scatter(sell_signals['date'], 
+                (1+sell_signals['cum_strategy_return'])*100, 
+                marker='v', color='red', s=100, label='卖出信号')
+    
+    plt.legend()
+    
+    plt.tight_layout()
+    
+    buffer = BytesIO()
+    plt.savefig(buffer, format='png')
+    buffer.seek(0)
+    image_base64 = base64.b64encode(buffer.read()).decode('utf-8')
+    plt.close()
+    
+    return image_base64
+
+
+def plot_optimization_heatmap(results_df):
+    """绘制参数优化热力图"""
+    if results_df is None or results_df.empty:
+        return None
+    
+    # 创建参数优化的热力图
+    pivot_table = results_df.pivot_table(
+        values='sharpe', 
+        index='short_window', 
+        columns='long_window'
+    )
+    
+    plt.figure(figsize=(12, 8))
+    sns.heatmap(
+        pivot_table, 
+        annot=True, 
+        cmap='YlGnBu', 
+        fmt='.2f',
+        cbar_kws={'label': 'Sharpe比率'}
+    )
+    
+    plt.title('均线策略参数优化 - Sharpe比率', fontsize=15)
+    plt.xlabel('长期均线窗口', fontsize=12)
+    plt.ylabel('短期均线窗口', fontsize=12)
+    
+    plt.tight_layout()
+    
+    buffer = BytesIO()
+    plt.savefig(buffer, format='png')
+    buffer.seek(0)
+    image_base64 = base64.b64encode(buffer.read()).decode('utf-8')
+    plt.close()
+    
+    return image_base64
+
+
+def analyze_index(df, name):
+    """全面分析指数技术面状况"""
+    if df is None or df.empty or len(df) < 30:
+        return f"无法分析{name}，数据不足"
+    
+    # 获取最新数据
+    latest = df.iloc[-1]
+    prev = df.iloc[-2]
+    
+    # 生成分析结果
+    analysis = []
+    
+    # 1. 基本行情信息
+    change = latest['close'] - prev['close']
+    change_pct = change / prev['close'] * 100
+    analysis.append(f"最新价格: {latest['close']:.2f}点")
+    analysis.append(f"较前一日: {'+' if change >= 0 else ''}{change:.2f}点 ({'+' if change_pct >= 0 else ''}{change_pct:.2f}%)")
+    analysis.append(f"交易日期: {latest['date'].strftime('%Y-%m-%d')}")
+    
+    # 2. 均线分析
+    analysis.append("\n【均线分析】")
+    if latest['close'] > latest['MA5']:
+        analysis.append("• 价格站上5日均线，短期趋势偏强")
+    else:
+        analysis.append("• 价格跌破5日均线，短期趋势偏弱")
+        
+    if latest['close'] > latest['MA20']:
+        analysis.append("• 价格站上20日均线，中期趋势偏强")
+    else:
+        analysis.append("• 价格跌破20日均线，中期趋势偏弱")
+        
+    if latest['close'] > latest['MA60']:
+        analysis.append("• 价格站上60日均线，长期趋势偏强")
+    else:
+        analysis.append("• 价格跌破60日均线，长期趋势偏弱")
+    
+    if latest['MA5'] > latest['MA10'] > latest['MA20'] > latest['MA60']:
+        analysis.append("• 标准多头排列，强势趋势确立")
+    elif latest['MA5'] < latest['MA10'] < latest['MA20'] < latest['MA60']:
+        analysis.append("• 标准空头排列，弱势趋势确立")
+    else:
+        recent_ma5 = df['MA5'].tail(5)
+        recent_ma20 = df['MA20'].tail(5)
+        if recent_ma5.iloc[0] < recent_ma20.iloc[0] and recent_ma5.iloc[-1] > recent_ma20.iloc[-1]:
+            analysis.append("• 5日均线上穿20日均线，形成金叉，可能是中期趋势向上转折点")
+        elif recent_ma5.iloc[0] > recent_ma20.iloc[0] and recent_ma5.iloc[-1] < recent_ma20.iloc[-1]:
+            analysis.append("• 5日均线下穿20日均线，形成死叉，可能是中期趋势向下转折点")
+        else:
+            analysis.append("• 均线系统处于交织状态，市场趋势尚不明确")
+    
+    # 3. MACD分析
+    analysis.append("\n【MACD分析】")
+    if latest['MACD'] > latest['MACD_SIGNAL']:
+        if df['MACD'].iloc[-2] <= df['MACD_SIGNAL'].iloc[-2]:
+            analysis.append("• MACD金叉形成，释放买入信号")
+        else:
+            analysis.append("• MACD位于信号线上方，多头趋势继续")
+    else:
+        if df['MACD'].iloc[-2] >= df['MACD_SIGNAL'].iloc[-2]:
+            analysis.append("• MACD死叉形成，释放卖出信号")
+        else:
+            analysis.append("• MACD位于信号线下方，空头趋势继续")
+    
+    # DIF与DEA都在零轴上方为强势市场，下方为弱势市场
+    if latest['MACD'] > 0 and latest['MACD_SIGNAL'] > 0:
+        analysis.append("• DIF和DEA均在零轴上方，属于强势行情")
+    elif latest['MACD'] < 0 and latest['MACD_SIGNAL'] < 0:
+        analysis.append("• DIF和DEA均在零轴下方，属于弱势行情")
+    else:
+        analysis.append("• DIF和DEA一上一下，市场处于转折期")
+    
+    # 4. KDJ分析
+    analysis.append("\n【KDJ分析】")
+    if latest['K'] > latest['D']:
+        if df['K'].iloc[-2] <= df['D'].iloc[-2]:
+            analysis.append("• KDJ金叉形成，市场可能筑底反弹")
+        else:
+            analysis.append("• K值位于D值上方，短期走势偏强")
+    else:
+        if df['K'].iloc[-2] >= df['D'].iloc[-2]:
+            analysis.append("• KDJ死叉形成，市场可能见顶回落")
+        else:
+            analysis.append("• K值位于D值下方，短期走势偏弱")
+    
+    # J值超买超卖
+    if latest['J'] > 100:
+        analysis.append("• J值超过100，处于严重超买区域，警惕回调风险")
+    elif latest['J'] > 80:
+        analysis.append("• J值处于80-100之间，属于超买区域，短期内可能出现回调")
+    elif latest['J'] < 0:
+        analysis.append("• J值低于0，处于严重超卖区域，可能出现技术性反弹")
+    elif latest['J'] < 20:
+        analysis.append("• J值处于0-20之间，属于超卖区域，短期内可能出现反弹机会")
+    
+    # 5. RSI分析
+    analysis.append("\n【RSI分析】")
+    if latest['RSI'] > 80:
+        analysis.append(f"• RSI为{latest['RSI']:.1f}，处于严重超买区域，警惕价格回落风险")
+    elif latest['RSI'] > 70:
+        analysis.append(f"• RSI为{latest['RSI']:.1f}，处于超买区域，注意可能出现回调")
+    elif latest['RSI'] < 20:
+        analysis.append(f"• RSI为{latest['RSI']:.1f}，处于严重超卖区域，可能出现较强反弹")
+    elif latest['RSI'] < 30:
+        analysis.append(f"• RSI为{latest['RSI']:.1f}，处于超卖区域，可能出现技术性反弹")
+    else:
+        if latest['RSI'] > 50:
+            analysis.append(f"• RSI为{latest['RSI']:.1f}，位于50以上的强势区间")
+        else:
+            analysis.append(f"• RSI为{latest['RSI']:.1f}，位于50以下的弱势区间")
+    
+    # 6. 布林带分析
+    analysis.append("\n【布林带分析】")
+    if latest['close'] > latest['BOLL_UPPER']:
+        analysis.append("• 价格突破布林带上轨，超买状态，存在回调可能")
+        analysis.append(f"• 布林带宽度: {latest['BOLL_WIDTH']*100:.2f}%，" + 
+                        ("显示趋势较强" if latest['BOLL_WIDTH'] > 0.05 else "显示趋势较弱"))
+    elif latest['close'] < latest['BOLL_LOWER']:
+        analysis.append("• 价格跌破布林带下轨，超卖状态，存在反弹可能")
+        analysis.append(f"• 布林带宽度: {latest['BOLL_WIDTH']*100:.2f}%，" + 
+                        ("显示趋势较强" if latest['BOLL_WIDTH'] > 0.05 else "显示趋势较弱"))
+    else:
+        position = (latest['close'] - latest['BOLL_LOWER']) / (latest['BOLL_UPPER'] - latest['BOLL_LOWER'])
+        analysis.append(f"• 价格位于布林带内，带内位置: {position*100:.2f}%")
+        if position > 0.8:
+            analysis.append("• 价格接近上轨，上行动能较强，但接近阻力位")
+        elif position < 0.2:
+            analysis.append("• 价格接近下轨，下行动能较强，但接近支撑位")
+        else:
+            analysis.append("• 价格处于布林带中段，波动性较低，趋势不明确")
+            
+        # 布林带收缩/扩张
+        recent_width = df['BOLL_WIDTH'].tail(10)
+        if recent_width.iloc[-1] < recent_width.iloc[0] * 0.8:
+            analysis.append("• 布林带近期收窄，可能预示行情即将突破")
+        elif recent_width.iloc[-1] > recent_width.iloc[0] * 1.2:
+            analysis.append("• 布林带近期扩张，市场波动性增强")
+    
+    # 7. 成交量分析
+    analysis.append("\n【成交量分析】")
+    recent_vol = df['volume'].iloc[-5:].mean()
+    prev_vol = df['volume'].iloc[-10:-5].mean()
+    vol_change = (recent_vol / prev_vol - 1) * 100
+    
+    # 单日成交量
+    day_vol_change = (latest['volume'] / prev['volume'] - 1) * 100
+    analysis.append(f"• 当日成交量: {latest['volume']/10**8:.2f}亿手，" + 
+                    f"较前日{'+' if day_vol_change >= 0 else ''}{day_vol_change:.2f}%")
+    
+    # 5日成交量
+    analysis.append(f"• 5日均成交量: {recent_vol/10**8:.2f}亿手，" + 
+                    f"较前5日{'+' if vol_change >= 0 else ''}{vol_change:.2f}%")
+    
+    if vol_change > 30:
+        analysis.append("• 近期成交量显著放大，市场交投活跃")
+        # 量价关系
+        price_change = (df['close'].iloc[-1] / df['close'].iloc[-6] - 1) * 100
+        if price_change > 0:
+            analysis.append("• 量价齐升，买盘力量增强，看涨信号")
+        else:
+            analysis.append("• 量增价跌，可能是下跌中继，谨慎看待")
+    elif vol_change < -30:
+        analysis.append("• 近期成交量显著萎缩，市场交投清淡")
+        # 量价关系
+        price_change = (df['close'].iloc[-1] / df['close'].iloc[-6] - 1) * 100
+        if price_change < 0:
+            analysis.append("• 量价齐跌，卖盘力量衰减，看空信号")
+        else:
+            analysis.append("• 量减价升，涨势可能难以持续，需谨慎")
+    else:
+        analysis.append("• 近期成交量变化不大，市场活跃度一般")
+    
+    # 8. 风险指标分析
+    risk_metrics = analyze_risk_metrics(df['daily_return'].tail(60))
+    analysis.append("\n【风险指标分析】")
+    analysis.append(f"• 60日年化波动率: {risk_metrics['annual_volatility']:.2f}%")
+    analysis.append(f"• 60日最大回撤: {risk_metrics['max_drawdown']:.2f}%")
+    analysis.append(f"• 60日夏普比率: {risk_metrics['sharpe_ratio']:.2f}")
+    
+    # 9. 支撑压力位
+    analysis.append("\n【支撑压力位】")
+    recent_high = df['high'].tail(20).max()
+    recent_low = df['low'].tail(20).min()
+    
+    # 近期高点作为压力位
+    pressure_1 = recent_high
+    pressure_2 = latest['BOLL_UPPER']
+    pressure_3 = latest['close'] * 1.03  # 简单的百分比压力位
+    
+    # 近期低点作为支撑位
+    support_1 = recent_low
+    support_2 = latest['BOLL_LOWER']
+    support_3 = latest['close'] * 0.97  # 简单的百分比支撑位
+    
+    analysis.append(f"• 第一压力位: {pressure_1:.2f}")
+    analysis.append(f"• 第二压力位: {pressure_2:.2f}")
+    analysis.append(f"• 第一支撑位: {support_1:.2f}")
+    analysis.append(f"• 第二支撑位: {support_2:.2f}")
+    
+    # 10. 综合评估
+    confluence = analyze_indicators_confluence(df)
+    analysis.append("\n【指标共振分析】")
+    analysis.append(f"• {confluence['conclusion']}")
+    for signal in confluence['signals'][:5]:  # 显示前5个信号
+        analysis.append(f"• {signal}")
+    
+    return "\n".join(analysis)
+
+
+def generate_report(all_data, analysis_results, charts, filename="index_analysis_report.html"):
+    """生成HTML格式的分析报告"""
+    # 获取市场情绪指标
+    sentiment = get_market_sentiment()
+    
+    # 准备回测结果
+    backtest_results = {}
+    optimization_charts = {}
+    
+    # 对每个指数进行回测和参数优化
+    for name, df in all_data.items():
+        if df is not None and not df.empty:
+            # 执行简单策略回测
+            backtest = backtest_simple_strategy(df.copy())
+            backtest_results[name] = backtest
+            
+            # 参数优化(只做小范围优化示例)
+            param_grid = {
+                'short_window': [3, 5, 7, 10],
+                'long_window': [15, 20, 25, 30]
+            }
+            best_params, best_score, results_df = optimize_parameters(df.copy(), param_grid)
+            
+            # 绘制参数优化热力图
+            heatmap = plot_optimization_heatmap(results_df)
+            optimization_charts[name] = heatmap
+    
+    # 简单的HTML模板
+    template_str = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>三大指数技术分析报告</title>
+        <meta charset="UTF-8">
+        <style>
+            body { 
+                font-family: Arial, sans-serif; 
+                max-width: 1200px; 
+                margin: 0 auto; 
+                padding: 20px;
+                background-color: #f5f5f5;
+            }
+            .header { 
+                text-align: center; 
+                margin: 20px 0;
+                padding: 20px;
+                background-color: #fff;
+                border-radius: 5px;
+                box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+            }
+            .header h1 {
+                color: #333;
+                margin-bottom: 10px;
+            }
+            .section {
+                margin: 30px 0;
+                padding: 20px;
+                background-color: #fff;
+                border-radius: 5px;
+                box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+            }
+            .chart { 
+                width: 100%; 
+                margin: 20px 0;
+                text-align: center;
+            }
+            .chart img {
+                max-width: 100%;
+                box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+                border-radius: 5px;
+            }
+            .analysis { 
+                margin: 20px 0; 
+                padding: 20px;
+                background-color: #f9f9f9;
+                border-radius: 5px;
+            }
+            h2 {
+                color: #333;
+                border-bottom: 1px solid #ddd;
+                padding-bottom: 10px;
+            }
+            h3 {
+                color: #666;
+            }
+            pre {
+                background-color: #f9f9f9;
+                padding: 10px;
+                border-radius: 5px;
+                white-space: pre-wrap;
+                font-family: Consolas, monospace;
+                font-size: 14px;
+                line-height: 1.6;
+            }
+            .sentiment {
+                padding: 15px;
+                margin: 20px 0;
+                background-color: #e9f7fe;
+                border-left: 4px solid #5bc0de;
+                border-radius: 3px;
+            }
+            .backtest {
+                margin-top: 20px;
+                padding: 15px;
+                background-color: #f0f7e6;
+                border-left: 4px solid #7cb342;
+                border-radius: 3px;
+            }
+            table {
+                width: 100%;
+                border-collapse: collapse;
+                margin: 15px 0;
+            }
+            table, th, td {
+                border: 1px solid #ddd;
+            }
+            th, td {
+                padding: 8px;
+                text-align: center;
+            }
+            th {
+                background-color: #f2f2f2;
+            }
+            .risk-good { color: green; }
+            .risk-bad { color: red; }
+            .risk-neutral { color: orange; }
+            .footer {
+                text-align: center;
+                margin-top: 30px;
+                padding: 10px;
+                font-size: 12px;
+                color: #888;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <h1>三大指数技术分析报告</h1>
+            <p>生成时间: {{ date }}</p>
+        </div>
+        
+        <div class="section">
+            <h2>市场情绪摘要</h2>
+            <div class="sentiment">
+                <p><strong>市场情绪:</strong> {{ sentiment.sentiment }}</p>
+                <p>{{ sentiment.description }}</p>
+            </div>
+        </div>
+        
+        <div class="section">
+            <h2>市场走势概览</h2>
+            
+            <div class="chart">
+                <h3>三大指数走势对比(归一化)</h3>
+                <img src="data:image/png;base64,{{ charts.normalized }}" alt="三大指数走势对比">
+            </div>
+            
+            <div class="chart">
+                <h3>三大指数成交量对比</h3>
+                <img src="data:image/png;base64,{{ charts.volume }}" alt="三大指数成交量对比">
+            </div>
+        </div>
+
+        {% for name, analysis in analysis_results.items() %}
+        <div class="section">
+            <h2>{{ name }}分析</h2>
+            
+            <div class="chart">
+                <h3>K线与指标</h3>
+                <img src="data:image/png;base64,{{ charts.technical[name] }}" alt="{{ name }}技术指标">
+            </div>
+            
+            <div class="analysis">
+                <h3>技术分析报告</h3>
+                <pre>{{ analysis }}</pre>
+            </div>
+            
+            <div class="backtest">
+                <h3>均线交叉策略回测</h3>
+                <p>回测周期: {{ backtest_results[name].period }}</p>
+                <table>
+                    <tr>
+                        <th>指标</th>
+                        <th>策略表现</th>
+                        <th>基准表现(指数)</th>
+                    </tr>
+                    <tr>
+                        <td>累计收益</td>
+                        <td {% if backtest_results[name].strategy_return > backtest_results[name].market_return %}class="risk-good"{% else %}class="risk-bad"{% endif %}>
+                            {{ "%.2f"|format(backtest_results[name].strategy_return) }}%
+                        </td>
+                        <td>{{ "%.2f"|format(backtest_results[name].market_return) }}%</td>
+                    </tr>
+                    <tr>
+                        <td>Alpha</td>
+                        <td {% if backtest_results[name].alpha > 0 %}class="risk-good"{% else %}class="risk-bad"{% endif %}>
+                            {{ "%.2f"|format(backtest_results[name].alpha) }}%
+                        </td>
+                        <td>-</td>
+                    </tr>
+                    <tr>
+                        <td>最大回撤</td>
+                        <td {% if backtest_results[name].strategy_metrics.max_drawdown > backtest_results[name].market_metrics.max_drawdown %}class="risk-bad"{% else %}class="risk-good"{% endif %}>
+                            {{ "%.2f"|format(backtest_results[name].strategy_metrics.max_drawdown) }}%
+                        </td>
+                        <td>{{ "%.2f"|format(backtest_results[name].market_metrics.max_drawdown) }}%</td>
+                    </tr>
+                    <tr>
+                        <td>夏普比率</td>
+                        <td {% if backtest_results[name].strategy_metrics.sharpe_ratio > 1 %}class="risk-good"{% elif backtest_results[name].strategy_metrics.sharpe_ratio > 0 %}class="risk-neutral"{% else %}class="risk-bad"{% endif %}>
+                            {{ "%.2f"|format(backtest_results[name].strategy_metrics.sharpe_ratio) }}
+                        </td>
+                        <td>{{ "%.2f"|format(backtest_results[name].market_metrics.sharpe_ratio) }}</td>
+                    </tr>
+                    <tr>
+                        <td>年化波动率</td>
+                        <td>{{ "%.2f"|format(backtest_results[name].strategy_metrics.annual_volatility) }}%</td>
+                        <td>{{ "%.2f"|format(backtest_results[name].market_metrics.annual_volatility) }}%</td>
+                    </tr>
+                    <tr>
+                        <td>胜率</td>
+                        <td>{{ "%.2f"|format(backtest_results[name].win_rate) }}%</td>
+                        <td>-</td>
+                    </tr>
+                </table>
+                
+                <div class="chart">
+                    <img src="data:image/png;base64,{{ charts.backtest[name] }}" alt="{{ name }}回测结果">
+                </div>
+                
+                <h3>参数优化分析</h3>
+                <p>不同均线参数组合的策略表现(Sharpe比率)</p>
+                <div class="chart">
+                    <img src="data:image/png;base64,{{ optimization_charts[name] }}" alt="{{ name }}参数优化">
+                </div>
+            </div>
+        </div>
+        {% endfor %}
+
+        <div class="footer">
+            <p>免责声明: 本报告仅供参考，不构成任何投资建议。投资有风险，入市需谨慎。</p>
+            <p>© {{ current_year }} Python股市分析工具 - 生成于 {{ date }}</p>
+        </div>
+    </body>
+    </html>
+    """
+    
+    # 准备图表数据
+    charts_data = {
+        'normalized': plot_normalized_indices(all_data),
+        'volume': plot_volume_comparison(all_data),
+        'technical': {},
+        'backtest': {}
+    }
+    
+    # 为每个指数生成技术分析图表和回测图表
+    for name, df in all_data.items():
+        if df is not None and not df.empty:
+            charts_data['technical'][name] = plot_technical_chart(df, name)
+            if name in backtest_results:
+                charts_data['backtest'][name] = plot_backtest_results(backtest_results[name], name)
+    
+    # 渲染模板
+    template = Template(template_str)
+    html = template.render(
+        date=datetime.now().strftime('%Y-%m-%d %H:%M'),
+        current_year=datetime.now().year,
+        sentiment=sentiment,
+        charts=charts_data,
+        analysis_results=analysis_results,
+        backtest_results=backtest_results,
+        optimization_charts=optimization_charts
+    )
+    
+    # 保存为文件
+    with open(filename, 'w', encoding='utf-8') as f:
+        f.write(html)
+    
+    return filename
+
+
+def main():
+    """主函数：完整的分析流程"""
+    # 获取起始日期(120天前)
+    start_date = (datetime.now() - timedelta(days=120)).strftime('%Y-%m-%d')
+    logger.info(f"开始分析，起始日期：{start_date}")
+    
+    # 存储所有数据的字典
+    all_data = {}
+    analysis_results = {}
+    
+    # 获取并处理每个指数的数据
+    for name, code in indices.items():
+        try:
+            # 安全获取数据
+            df = safe_get_data(code, name)
+            if df is None:
+                logger.warning(f"无法获取{name}数据，跳过分析")
+                continue
+                
+            # 预处理数据
+            df = preprocess_data(df, start_date)
+            if df is None or len(df) < 30:
+                logger.warning(f"{name}数据预处理后不足，跳过分析")
+                continue
+                
+            # 计算技术指标
+            df = calculate_indicators(df)
+            
+            # 保存处理好的数据
+            all_data[name] = df
+            
+            # 分析指数
+            analysis_results[name] = analyze_index(df, name)
+            
+            # 打印基本信息
+            latest = df.iloc[-1]
+            prev = df.iloc[-2]
+            change = latest['close'] - prev['close']
+            change_pct = change / prev['close'] * 100
+            
+            print(f"\n{name}最新行情 (日期: {latest['date'].strftime('%Y-%m-%d')}):")
+            print(f"收盘价: {latest['close']:.2f}")
+            print(f"涨跌额: {change:.2f}")
+            print(f"涨跌幅: {change_pct:.2f}%")
+            print(f"成交量: {latest['volume']/10**8:.2f}亿手")
+            print("-" * 50)
+            
+        except Exception as e:
+            logger.error(f"处理{name}数据时出错: {e}")
+            logger.error(traceback.format_exc())
+    
+    # 生成HTML报告
+    if all_data:
+        report_file = generate_report(all_data, analysis_results, {})
+        print(f"\n分析报告已成功生成: {report_file}")
+        
+        # 尝试自动打开浏览器查看报告
+        try:
+            import webbrowser
+            webbrowser.open(f"file://{os.path.abspath(report_file)}")
+        except:
+            pass
+    else:
+        print("未获取到任何有效数据，无法生成报告")
+
+
+if __name__ == "__main__":
+    main()
